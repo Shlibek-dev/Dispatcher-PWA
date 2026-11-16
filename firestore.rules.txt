@@ -1,0 +1,136 @@
+// ============================================================
+// Dispatcher V14.1 - Firestore rules   (Invoicer prep: allow-list + order guard)
+// FOR REVIEW - DO NOT AUTO-PUBLISH.
+// Publish manually: Firebase Console > Firestore Database > Rules.
+//
+// WHAT CHANGED vs V14.0
+//  1. ALLOW-LIST: the generic rule now covers only Dispatcher's six collections
+//     (orders, notes, customers, items, meta, trash). Any other collection under the
+//     shared root (invoices, itemPrices, invMeta, invTrash ...) is denied to
+//     Dispatcher admins AND viewers until Invoicer's own rules exist (next run).
+//  2. ORDER GUARD: orders have their own create / update / delete rules. Dispatcher
+//     may never SET invoiceId or conversionLock. It can only
+//       - keep invoiceId unchanged or clear it (null). If the stored order has an
+//         invoiceId, the write must still contain the key (a stale copy that lacks it is denied);
+//       - release a conversion lock (set it to null). While an order is locked the ONLY
+//         permitted Dispatcher write is that release, and the order cannot be deleted.
+//  3. Everything else (Pen / lease, viewers, trash visibility) is unchanged from V14.0.
+//
+// BEFORE PUBLISHING:
+//   PASTE_UID_viewer@dispatcher.com  -> replace with the real UID of viewer@dispatcher.com
+//     (Firebase Console > Authentication > Users > "User UID").
+//   The admin UIDs below are the ones from V14.0; check them again if the admin list changed.
+//
+// ORDER OF ROLLOUT: deploy the V14.1 ZIP first and open it once on every admin phone,
+// THEN publish these rules. Keep the V14.0 rules text at hand for rollback.
+// Test after publishing: save an order, Mark Closed, Trash and restore one order, and one
+// large archive batch.
+// Admin list changes need three edits: this file, ADMINS in js/app.js, isAdminEmail() below.
+// Delete this file from the deployed site if you do not want it public.
+// ============================================================
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // The one shared data tree: users/<this UID>/...
+    function sharedRoot() {
+      return 'ZlJYN1xSrTZiYivlHydVIWNBXRo1';
+    }
+    function signedIn() {
+      return request.auth != null;
+    }
+    function isRoot() {
+      return signedIn() && request.auth.uid == sharedRoot();
+    }
+    function isAdmin() {
+      return signedIn() && request.auth.uid in [
+        'ZlJYN1xSrTZiYivlHydVIWNBXRo1',                 // shlibek@outlook.com (owner)
+        'qFis4KZqsohYG4wfCVLSFFA5PDv2',
+        'HGfQ1gny1gQJKNVecMtWI8f4uxp1'
+      ];
+    }
+    function isViewer() {
+      return signedIn() && request.auth.uid in [
+        'PASTE_UID_viewer@dispatcher.com'
+      ];
+    }
+    // The lease names its holder by e-mail (lower case); compare with the signed-in token.
+    function myEmail() {
+      return request.auth.token.email.lower();
+    }
+    function isAdminEmail(e) {
+      return e in [
+        'shlibek@outlook.com',
+        'anas.admin@dispatcher.com',
+        'mohmd.admin@dispatcher.com'
+      ];
+    }
+    // True only for the current Pen Holder. Fails (denies) if the lease document is missing.
+    function holdsPen() {
+      return get(/databases/$(database)/documents/users/$(sharedRoot())/meta/lease).data.email == myEmail();
+    }
+    function validLease() {
+      return request.resource.data.keys().hasOnly(['email', 'name', 'at', 'how', 'by'])
+          && request.resource.data.email is string
+          && request.resource.data.how in ['handoff', 'override', 'bootstrap', 'reset'];
+    }
+
+    // Dispatcher's own collections (allow-list).
+    function dispatcherColl(c) {
+      return c in ['orders', 'notes', 'customers', 'items', 'meta', 'trash'];
+    }
+
+    // ORDER GUARD (Invoicer prep). Dispatcher never sets invoiceId / conversionLock.
+    function noNewMarks() {
+      return (!('invoiceId' in request.resource.data) || request.resource.data.invoiceId == null)
+          && (!('conversionLock' in request.resource.data) || request.resource.data.conversionLock == null);
+    }
+    function orderUpdateOk() {
+      let oldLock = resource.data.get('conversionLock', null);
+      let oldInv = resource.data.get('invoiceId', null);
+      let nd = request.resource.data;
+      return (oldLock == null
+                ? (!('conversionLock' in nd) || nd.conversionLock == null)
+                : (('conversionLock' in nd) && nd.conversionLock == null
+                   && nd.diff(resource.data).affectedKeys().hasOnly(['conversionLock'])))
+          && (oldInv == null
+                ? (!('invoiceId' in nd) || nd.invoiceId == null)
+                : (('invoiceId' in nd) && (nd.invoiceId == null || nd.invoiceId == oldInv)));
+    }
+
+    // coll = orders | notes | customers | items | meta | trash
+    match /users/{owner}/{coll}/{docId} {
+      allow read:  if owner == sharedRoot() && dispatcherColl(coll)
+                   && (isAdmin() || (isViewer() && coll != 'trash'));
+      // Data writes: admin AND Pen Holder. The lease document is excluded here on purpose.
+      // 'orders' is excluded here: it has its own rules below.
+      allow write: if owner == sharedRoot() && isAdmin() && dispatcherColl(coll) && coll != 'orders'
+                   && !(coll == 'meta' && docId == 'lease')
+                   && holdsPen();
+    }
+
+    // Orders: Pen Holder only, plus the guard above.
+    match /users/{owner}/orders/{docId} {
+      allow create: if owner == sharedRoot() && isAdmin() && holdsPen() && noNewMarks();
+      allow update: if owner == sharedRoot() && isAdmin() && holdsPen() && orderUpdateOk();
+      allow delete: if owner == sharedRoot() && isAdmin() && holdsPen()
+                    && resource.data.get('conversionLock', null) == null;
+    }
+
+    // The lease itself (The Pen).
+    match /users/{owner}/meta/lease {
+      // Bootstrap: only when the document does not exist yet; an admin can only name themselves.
+      allow create: if owner == sharedRoot() && isAdmin() && validLease()
+                    && request.resource.data.email == myEmail();
+      // Override: any admin can take the Pen (radio discipline is the guardrail).
+      // Handoff: the current holder can name another admin.
+      allow update: if owner == sharedRoot() && isAdmin() && validLease()
+                    && (request.resource.data.email == myEmail()
+                        || (resource.data.email == myEmail()
+                            && isAdminEmail(request.resource.data.email)));
+      // Break-glass: the owner account can write, repair or delete the lease at any time.
+      allow write:  if owner == sharedRoot() && isRoot();
+    }
+    // Everything else: denied by default.
+  }
+}
